@@ -14,6 +14,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from my_task import TOKEN_MAP
+
+# proxies = {
+#     "https": "http://fwdproxy:8080",
+#     "http": "http://fwdproxy:8080",
+#     "ftp": "http://fwdproxy:8080",
+# }
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -122,6 +129,49 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+class FinetuneWrapper(nn.Module):
+    def __init__(self, gpt):
+        super().__init__()
+        self.gpt = gpt
+        vocab_size = self.gpt.config.vocab_size
+        # Translator - BackTranslator configs
+        # TODOs: add activation layer, add dropout, add L1 regularization, add grad clip, increase batch size? but if large batch is required, our original sample efficiency goal fails
+        # -----------------------------------------------------------------------------
+        # linear transform N_TASK_VOCAB x N_GPT_VOCAB
+        dropout = 0.5
+        self.translator = nn.Sequential(
+            nn.Embedding(len(TOKEN_MAP), 64, padding_idx=TOKEN_MAP['PAD'], max_norm=1),
+            nn.ReLU(),
+            nn.Linear(64, 512, bias=False),
+            nn.ReLU(),
+            nn.Linear(512, 2048, bias=False),
+            nn.ReLU(),
+            nn.Linear(2048, vocab_size, bias=False),
+            nn.Dropout(dropout),
+        )
+        # here we actually try to init a MLP, can try "xavier_normal_" as well
+        # nn.init.xavier_uniform_(self.translator.weight)
+        # -----------------------------------------------------------------------------
+        self.back_translator = nn.Linear(vocab_size, len(TOKEN_MAP), bias=False)
+        nn.init.xavier_uniform_(self.back_translator.weight)
+        self.dropout = nn.Dropout(0.99)
+        self.activation = nn.ReLU()
+
+    def forward(self, idx, targets=None):
+        src = self.translator(idx) # [b, t, n_vocab]
+        # src = self.dropout(src)
+        out = self.gpt(src) # gpt output logits
+        # out = self.dropout(out)
+        logits = self.back_translator(out) # [b,t,n_tokens]
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            logits = logits[:, [-1], :]
+            loss = None
+
+        return logits, loss
+
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -174,30 +224,32 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, task_tok_emb):
+        device = task_tok_emb.device
+        b, t, _ = task_tok_emb.size() # [b, t, n_vocab]
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        tok_emb = torch.matmul(task_tok_emb, self.transformer.wte.weight) # [b, t, n_embd]
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        # if targets is not None:
+        #     # if we are given some desired targets also calculate the loss
+        #     logits = self.lm_head(x)
+        #     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        # else:
+        #     # inference-time mini-optimization: only forward the lm_head on the very last position
+        #     logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+        #     loss = None
 
-        return logits, loss
+        # return logits, loss
+        return self.lm_head(x)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -241,7 +293,7 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        model_hf = GPT2LMHeadModel.from_pretrained("./gpt2")
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
@@ -264,7 +316,7 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
-        return model
+        return FinetuneWrapper(model)
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
