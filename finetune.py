@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from model import GPT
-from my_task import FixedLenAdditionDataset, LOW, MAX_SEQ_LEN, STOP_TOKEN
+from my_task import FixedLenAdditionDataset, GPTTokenizer, LOW, MAX_SEQ_LEN, STOP_TOKEN
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -40,16 +40,14 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # -----------------------------------------------------------------------------
 
 
-batch_size = 64
+batch_size = 32
 eval_batch_size = 10
 log_interval = 10
 # adamw optimizer or SGD
-learning_rate = 6e-4 # max learning rate
-# weight_decay = 1e-1
+learning_rate = 1e-3 # max learning rate
+weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-weight_decay = 0.01
-lambda1 = 1e-4  # L1 regularization
 # grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 NUM_EPOCHES = 20
@@ -57,7 +55,7 @@ NUM_EXAMPLES = 10000
 
 decay_lr = False # whether to decay the learning rate
 warmup_iters = 1000 # how many steps to warm up for
-lr_decay_iters = int(NUM_EPOCHES * NUM_EXAMPLES / batch_size) # should be ~= max_iters per Chinchilla
+lr_decay_iters = int(NUM_EPOCHES * NUM_EXAMPLES / batch_size) * 2 # should be ~= max_iters per Chinchilla
 print("lr_decay max steps: ", lr_decay_iters)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
@@ -74,10 +72,11 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 # train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 # val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-d1 = FixedLenAdditionDataset(num_examples=NUM_EXAMPLES) # noqa
-d2 = FixedLenAdditionDataset(low=0, high=LOW, in_order=True)
+tokenizer = GPTTokenizer(MAX_SEQ_LEN)
+d1 = FixedLenAdditionDataset(num_examples=NUM_EXAMPLES, tokenizer=tokenizer) # noqa
+d2 = FixedLenAdditionDataset(low=0, high=LOW, in_order=True, tokenizer=tokenizer)
 dataloader  = torch.utils.data.DataLoader(ConcatDataset([d1, d2]), batch_size=batch_size, shuffle=True)
-val_dataset = FixedLenAdditionDataset(num_examples=200, low=1000, high=9999)
+val_dataset = FixedLenAdditionDataset(num_examples=200, low=1000, high=9999, tokenizer=tokenizer)
 num_prompt = 4 + 4 + 2
 val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=eval_batch_size)
 print('Training Dataloader Len | batch_size: ', len(dataloader), batch_size)
@@ -168,12 +167,7 @@ model = GPT.from_pretrained(init_from, override_args)
 
 model.to(device)
 
-
-## 3 choices : 1) AdamW; 2) SGD + L1 ; 3) Adam + L1
-# optimizer = torch.optim.AdamW(list(model.translator.parameters()) + list(model.back_translator.parameters()), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
-optimizer = torch.optim.Adam(list(model.translator.parameters()) + list(model.back_translator.parameters()), lr=learning_rate, betas=(beta1, beta2), fused=True)
-
-# optimizer = torch.optim.SGD(list(model.translator.parameters()) + list(model.back_translator.parameters()), lr=learning_rate)
+optimizer = torch.optim.AdamW([model.inductor], lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 
 
 print('optimizer targeted params: ', optimizer.param_groups)
@@ -224,9 +218,6 @@ for i in range(NUM_EPOCHES):  # num of epoches
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         with ctx:
             logits, loss = model(x, y)
-            all_linear1_params = torch.cat([x.view(-1) for x in model.translator.parameters()] + [x.view(-1) for x in model.back_translator.parameters()])
-            l1_regularization = lambda1 * torch.norm(all_linear1_params, 1)
-            loss += l1_regularization
 
         # backward pass, with gradient scaling if training in fp16
     #     scaler.scale(loss).backward()
@@ -249,10 +240,10 @@ for i in range(NUM_EPOCHES):  # num of epoches
         t0 = t1
         if batch_idx % log_interval == 0 and master_process:
             lossf = loss.item() # loss as float. note: this is a CPU-GPU sync point
-            regf = l1_regularization.item()
-            print(f"[Epoch {i}] iter {batch_idx}: loss {lossf:.4f}, reg {regf:.4f} time {dt*1000:.2f}ms")
+            print(f"[Epoch {i}] iter {batch_idx}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
 
-    run_eval(model)
+    print('skip eval for now!')
+    # run_eval(model)
 
 checkpoint = {
                     'model': raw_model.state_dict(),
