@@ -2,29 +2,29 @@
 > cd & source nanogpt/bin/activate
 > cd rsc/nanoGPT/
 > export TIKTOKEN_CACHE_DIR=/home/shermanwong/rsc/nanoGPT/cached_tiktoken/
-> python finetune.py
+> python finetune.py <train/eval>
 
 """
 import math
 import os
+import sys
 import time
 from contextlib import nullcontext
 
 import numpy as np
 
 import torch
-
+from arithmetics_task import generate_train_val_dataset, TARGET_TOKENS
 from model import GPT
-from my_task import FixedLenAdditionDataset, GPTTokenizer, LOW, MAX_SEQ_LEN, STOP_TOKEN
+from task_common import compute_acc
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import ConcatDataset
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText, DO NOT TOUCH!!!
 # I/O
-out_dir = 'out'
+out_dir = '/home/shermanwong/out'
 # always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # data
@@ -38,27 +38,28 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # -----------------------------------------------------------------------------
+## Basic Settings
+eval_only = (sys.argv[1] == "eval")
+ckpt_name = 'ckpt.pt'
+log_interval = 10
 
+# grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# learning rate decay settings
+NUM_EPOCHES = 20
 
+## LR settings
+# adamw optimizer or SGD
 batch_size = 32
 eval_batch_size = 10
-log_interval = 10
-# adamw optimizer or SGD
 learning_rate = 1e-3 # max learning rate
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-# grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-NUM_EPOCHES = 20
-NUM_EXAMPLES = 10000
-
 decay_lr = False # whether to decay the learning rate
 warmup_iters = 1000 # how many steps to warm up for
-lr_decay_iters = int(NUM_EPOCHES * NUM_EXAMPLES / batch_size) * 2 # should be ~= max_iters per Chinchilla
-print("lr_decay max steps: ", lr_decay_iters)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
+
+## DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -69,61 +70,58 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 # dataset configs
 # -----------------------------------------------------------------------------
+dataset, val_dataset = generate_train_val_dataset(eval_only=eval_only)
+if not eval_only:
+    dataloader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    print('Training Dataloader Len | batch_size | max_iters: ', len(dataloader), batch_size, len(dataloader) * NUM_EPOCHES)
+    lr_decay_iters = len(dataloader) * NUM_EPOCHES # should be ~= max_iters per Chinchilla
+    print("lr_decay max steps: ", lr_decay_iters)
 
-# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-tokenizer = GPTTokenizer(MAX_SEQ_LEN)
-d1 = FixedLenAdditionDataset(num_examples=NUM_EXAMPLES, tokenizer=tokenizer) # noqa
-d2 = FixedLenAdditionDataset(low=0, high=LOW, in_order=True, tokenizer=tokenizer)
-dataloader  = torch.utils.data.DataLoader(ConcatDataset([d1, d2]), batch_size=batch_size, shuffle=True)
-val_dataset = FixedLenAdditionDataset(num_examples=200, low=1000, high=9999, tokenizer=tokenizer)
-num_prompt = 4 + 4 + 2
 val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=eval_batch_size)
-print('Training Dataloader Len | batch_size: ', len(dataloader), batch_size)
 print('Eval Dataloader Len | batch_size : ', len(val_dataloader), eval_batch_size)
 # -----------------------------------------------------------------------------
 
+
+
 def run_eval(model):
-    """There are 2 types of eval acc, 1) auto-regressive 2) teacher enforced
-    """
     def _sample(logit):
         probs = F.softmax(logit.squeeze(), dim=1) # [b, C]
         return torch.multinomial(probs, 1).int()  # (1,)
 
     model.eval()
-    acc1, acc2, acc3 = [], [], []
-
+    acc1, acc3 = [], []
     for batch_idx, batch in enumerate(val_dataloader):
         # eval batch size is 1
-        input = batch.to(device).squeeze()  # (b,n,) padded to max_seq_len
+        src = batch["src"] # [b,max_seq_len]
+        tgt = batch["tgt"] # [b,max_seq_len]
+        num_prompts = batch["num_prompt"].detach().numpy()
+        if not np.all(num_prompts[0] == num_prompts):
+            print(f"[WARNING]:: num_prompts in batch: {num_prompts} are not even, no bueno during batched eval! using max prompt, check tokenizer")
+            num_prompt = num_prompts.max()
+        else:
+            num_prompt = num_prompts[0]
+        input = src.to(device).squeeze()  # (b,n,) padded to max_seq_len
         p1 = input[:,:num_prompt].int()  # "1234+1234="
-        p2 = torch.clone(p1)
         # start auto-regressive decoding
-        while p1.shape[1] < MAX_SEQ_LEN: # fixed length decoding
+        while p1.shape[1] < val_dataset.max_seq_len: # fixed length decoding
             # auto-regressive
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
             l1, _ = model(p1)  # [b,1,C]
-            # teacher enforced
+            # teacher enforced -- not really useful
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-            l2, _ = model(input[:,:p2.shape[1]])
             s1 = _sample(l1)
-            s2 = _sample(l2)
             p1 = torch.cat([p1, s1], dim=1)
-            p2 = torch.cat([p2, s2], dim=1)
 
 
-        # accuracy, vocab is >10, so a random guess acc is <10%
-        # auto-regressive acc
-        acc1.append(torch.sum(input[:,num_prompt:] == p1[:,num_prompt:]).detach().item() / p1.nelement())
-        # teacher enforcing acc
-        acc2.append(torch.sum(input[:,num_prompt:] == p2[:,num_prompt:]).detach().item() / p2.nelement())
-        # # acc3, fully match
-        acc3.append(1- torch.any(input[:,num_prompt:] != p1[:,num_prompt:], dim=1).float().mean().detach().item())
+        a1, a3 = compute_acc(p1.detach().cpu().numpy(), tgt.detach().cpu().numpy(), num_prompt)
+        acc1.append(a1)
+        acc3.append(a3)
 
-    print(f"eval size: {len(val_dataset)} prompt len: {num_prompt} eval acc1: {np.mean(acc1)}, acc2: {np.mean(acc2)}, acc3: {np.mean(acc3)}", )
+    print(f"eval size: {len(val_dataset)} prompt len: {num_prompt} eval acc1: {np.mean(acc1)}, acc3: {np.mean(acc3)}", )
     print("============== sampled output ==========")
-    print("input:  ", val_dataset.reverse_tokenize(input[0]))
-    print("output: ", val_dataset.reverse_tokenize(p1[0]))
+    print("input:  ", val_dataset.tokenizer.reverse(input[0]))
+    print("target: ", val_dataset.tokenizer.reverse(tgt[0][num_prompt-1:]))
+    print("output: ", val_dataset.tokenizer.reverse(p1[0][num_prompt:]))
 
 
 
@@ -160,14 +158,14 @@ ctx = nullcontext()
 print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
 # initialize from OpenAI GPT-2 weights
 override_args = dict(dropout=dropout)
-model = GPT.from_pretrained(init_from, override_args)
+model = GPT.from_pretrained(init_from, TARGET_TOKENS, override_args)
 # # read off the created config params, so we can store them into checkpoint correctly
 # for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
 #     model_args[k] = getattr(model.config, k)
 
 model.to(device)
 
-optimizer = torch.optim.AdamW([model.inductor], lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.inductor.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 
 
 print('optimizer targeted params: ', optimizer.param_groups)
@@ -201,7 +199,22 @@ def get_lr(it):
     # wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # val sanity check before train loop
-run_eval(model)
+if eval_only:
+    ckpt_path = os.path.join(out_dir, ckpt_name)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    state_dict = checkpoint['inductor']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.inductor.load_state_dict(state_dict)
+    run_eval(model)
+    print('done eval only, returning....')
+    exit(0)
+
+
 # training loop
 t0 = time.time()
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -213,8 +226,8 @@ for i in range(NUM_EPOCHES):  # num of epoches
         lr = get_lr(batch_idx) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        x = batch[:, :-1]
-        y = batch[:, 1:]
+        x = batch['src']
+        y = batch['tgt']
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         with ctx:
             logits, loss = model(x, y)
@@ -242,13 +255,12 @@ for i in range(NUM_EPOCHES):  # num of epoches
             lossf = loss.item() # loss as float. note: this is a CPU-GPU sync point
             print(f"[Epoch {i}] iter {batch_idx}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
 
-    print('skip eval for now!')
-    # run_eval(model)
+    run_eval(model)
 
 checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                }
+                    'inductor': raw_model.inductor.state_dict(),
+                    # 'optimizer': optimizer.state_dict(),
+            }
 print(f"saving checkpoint to {out_dir}")
 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 if ddp:

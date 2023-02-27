@@ -130,79 +130,28 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 
-class FinetuneWrapper(nn.Module):
-    def __init__(self, gpt):
+class Inductor(nn.Module):
+    def __init__(self, wte, n_embd, prefix_tokens):
         super().__init__()
-        self.gpt = gpt
-        # vocab_size = self.gpt.config.vocab_size
-        # Translator - BackTranslator configs
-        # TODOs: add activation layer, add dropout, add L1 regularization, add grad clip, increase batch size? but if large batch is required, our original sample efficiency goal fails
-        # -----------------------------------------------------------------------------
-        # linear transform N_TASK_VOCAB x N_GPT_VOCAB
-        # dropout = 0.5
-        # self.translator = nn.Sequential(
-        #     nn.Embedding(len(TOKEN_MAP), 64, padding_idx=TOKEN_MAP['PAD'], max_norm=1),
-        #     nn.ReLU(),
-        #     nn.Linear(64, 512, bias=False),
-        #     nn.ReLU(),
-        #     nn.Linear(512, 2048, bias=False),
-        #     nn.ReLU(),
-        #     nn.Linear(2048, vocab_size, bias=False),
-        #     nn.Dropout(dropout),
-        # )
-        # # here we actually try to init a MLP, can try "xavier_normal_" as well
-        # # nn.init.xavier_uniform_(self.translator.weight)
-        # # -----------------------------------------------------------------------------
-        # self.back_translator = nn.Linear(vocab_size, len(TOKEN_MAP), bias=False)
-        # nn.init.xavier_uniform_(self.back_translator.weight)
-        # self.dropout = nn.Dropout(0.99)
-        # self.activation = nn.ReLU()
-
-        ## Inductor
-        # 3 options:
-        #    Option 1 - random fill only
-        #    Option 2 - mixed random fill and class label fill  -- the best
-        #    Option 3 - class label fill only
-        # -----------------------------------------------------------------------------
-
-        a = torch.zeros(1, 100, self.gpt.config.n_embd)
+        a = torch.zeros(1, 100, n_embd)
         # part of tokens use random init,
         nn.init.xavier_uniform_(a)
 
-        # part of them use
-        target_tokens = [
-            "0",
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-            "7",
-            "8",
-            "9",
-            "+",
-            "=",
-            ";",
-            # "plus", "minus", "arithmetic", "equal", "digit", "calculate", "carry bits", "radix", "bit", "add", "number",
-            # chain-of-thought (CoT) like prompt
-            "number", "plus", "number", "equals to", "digit", "plus", "digit", "plus", "carry bits", "next",
-        ]
         enc = tiktoken.get_encoding("gpt2")
         ids = []
-        for t in target_tokens:
+        for t in prefix_tokens:
             ids.extend(enc.encode(t))
-        embs = self.gpt.transformer.wte(torch.tensor(ids, dtype=torch.long)).detach() # [n, d]
+        embs = wte(torch.tensor(ids, dtype=torch.long)).detach() # [n, d]
 
         a[:,:len(ids)] = embs
 
         # a = embs.unsqueeze(0)  # option 3
         print(f"num of tokens: {a.size()[1]} num of label init tokens: {len(ids)}")
-        self.inductor = nn.Parameter(a)
+        self._inductor = nn.Parameter(a)
 
 
-    def forward(self, idx, targets=None):
-        return self.gpt(idx, targets, self.inductor) # gpt output logits
+    def forward(self):
+        return self._inductor
 
 
 
@@ -238,6 +187,11 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def add_inductor(self, prefix_tokens):
+         # inject inductor
+        self.inductor = Inductor(self.transformer.wte, self.config.n_embd, prefix_tokens)
+
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -258,9 +212,18 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, inductor=None):
+    def forward(self, idx, targets=None):
+        """
+        Args:
+            input:    p1  p2  p3... pn    x     y    z
+            targets:  -1  -1  -1 ... x     y     z   [END]  -- should be exact same size as input
+                here, "-1" tells cross entropy loss function to ignore prompt indices
+        Returns:
+            return loss if targets is specified, otherwise, return the last decoded element
+        """
         device = idx.device
         b, t = idx.size()
+        inductor = self.inductor()
         k = inductor.shape[1]
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
@@ -273,7 +236,7 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        # drop the prefix
+        # drop the inductor prefix
         x = x[:,k:]
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -297,7 +260,7 @@ class GPT(nn.Module):
             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(cls, model_type, prefix_tokens, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -351,7 +314,8 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
-        return FinetuneWrapper(model)
+        model.add_inductor(prefix_tokens)
+        return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
