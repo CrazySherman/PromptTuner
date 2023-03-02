@@ -5,6 +5,7 @@
 > python finetune.py <train/eval>
 
 """
+import argparse
 import math
 import os
 import sys
@@ -21,10 +22,31 @@ from torch.distributed import destroy_process_group, init_process_group
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+parser = argparse.ArgumentParser(description='GPT2 prompt tuner')
+parser.add_argument('--out-dir', '-o', type=str, default='/home/shermanwong/out')
+parser.add_argument('--eval', action="store_true")
+parser.add_argument('--ckpt-name', type=str, default='ckpt.pt')
+parser.add_argument('--epoches', type=int, default=20)
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--warmup-iters', type=int, default=1000)
+parser.add_argument('--wd', type=float, default=1e-1)
+parser.add_argument('--decay-lr', action="store_true")
+parser.add_argument('--min-lr', type=float, default=6e-5)
+parser.add_argument('--use-mlp', action="store_true")
+parser.add_argument('--mlp-dropout', type=float, default=0.0)
+parser.add_argument('--few-shot', type=int, default=0)
+parser.add_argument('--eval-range', type=int, nargs="+")
+parser.add_argument('--epoch_val', action="store_true")
+parser.add_argument('--max-seq-len', type=int, default=None)
+
+args = parser.parse_args()
+
+
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText, DO NOT TOUCH!!!
 # I/O
-out_dir = '/home/shermanwong/out'
+out_dir = args.out_dir
 # always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # data
@@ -39,25 +61,29 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # -----------------------------------------------------------------------------
 ## Basic Settings
-eval_only = (sys.argv[1] == "eval")
-ckpt_name = 'ckpt.pt'
+eval_only = args.eval
+ckpt_name = args.ckpt_name
 log_interval = 10
 
 # grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-NUM_EPOCHES = 20
+NUM_EPOCHES = args.epoches
 
 ## LR settings
 # adamw optimizer or SGD
 batch_size = 32
 eval_batch_size = 10
-learning_rate = 1e-3 # max learning rate
-weight_decay = 1e-1
+learning_rate = args.lr # max learning rate
+weight_decay = args.wd
 beta1 = 0.9
 beta2 = 0.95
-decay_lr = False # whether to decay the learning rate
-warmup_iters = 1000 # how many steps to warm up for
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+decay_lr = args.decay_lr # whether to decay the learning rate
+warmup_iters = args.warmup_iters # how many steps to warm up for
+min_lr = args.min_lr # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
+# model settings
+use_mlp = args.use_mlp
+mlp_dropout = args.mlp_dropout
 
 ## DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -70,7 +96,7 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 # dataset configs
 # -----------------------------------------------------------------------------
-dataset, val_dataset = generate_train_val_dataset(eval_only=eval_only)
+dataset, val_dataset = generate_train_val_dataset(max_seq_len=args.max_seq_len, eval_only=eval_only, eval_range=args.eval_range, few_shot=None if args.few_shot == 0 else args.few_shot + 1)
 if not eval_only:
     dataloader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     print('Training Dataloader Len | batch_size | max_iters: ', len(dataloader), batch_size, len(dataloader) * NUM_EPOCHES)
@@ -158,7 +184,8 @@ ctx = nullcontext()
 print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
 # initialize from OpenAI GPT-2 weights
 override_args = dict(dropout=dropout)
-model = GPT.from_pretrained(init_from, TARGET_TOKENS, override_args)
+model = GPT.from_pretrained(init_from, override_args)
+model.add_inductor(TARGET_TOKENS, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
 # # read off the created config params, so we can store them into checkpoint correctly
 # for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
 #     model_args[k] = getattr(model.config, k)
@@ -255,13 +282,16 @@ for i in range(NUM_EPOCHES):  # num of epoches
             lossf = loss.item() # loss as float. note: this is a CPU-GPU sync point
             print(f"[Epoch {i}] iter {batch_idx}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
 
-    run_eval(model)
+    if args.epoch_val:
+        run_eval(model)
 
 checkpoint = {
                     'inductor': raw_model.inductor.state_dict(),
                     # 'optimizer': optimizer.state_dict(),
             }
-print(f"saving checkpoint to {out_dir}")
-torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
+path = os.path.join(out_dir, ckpt_name)
+print(f"saving checkpoint to {path}")
+torch.save(checkpoint, path)
 if ddp:
     destroy_process_group()

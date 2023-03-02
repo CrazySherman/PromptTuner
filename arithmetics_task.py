@@ -130,16 +130,30 @@ class FixedLenAdditionDataset(Dataset):
         return result
 
 
-def generate_train_val_dataset(max_seq_len=MAX_SEQ_LEN, eval_only=False):
+def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False, eval_range=None):
+    """Few shot settings:
+        None -- zero-shot
+        2 - 1-shot, so basically 1 demo + 1 query
+        3 - 2-host, 2 demo + 1 query
+    """
     # train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     # val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    if max_seq_len is None:
+        max_seq_len = MAX_SEQ_LEN
+
     tokenizer = GPTTokenizer(max_seq_len, START_INDICATOR)
     if not eval_only:
-        d1 = FixedLenAdditionDataset(max_seq_len, num_examples=NUM_EXAMPLES, tokenizer=tokenizer) # noqa
-        d2 = FixedLenAdditionDataset(max_seq_len, low=0, high=LOW, in_order=True, tokenizer=tokenizer)
+        d1 = FixedLenAdditionDataset(max_seq_len, num_examples=NUM_EXAMPLES, tokenizer=tokenizer, few_shot=few_shot) # noqa
+        d2 = FixedLenAdditionDataset(max_seq_len, low=0, high=LOW, in_order=True, tokenizer=tokenizer, few_shot=few_shot)
         dataset = ConcatDataset([d1, d2])
     else:
         dataset = None
-    val_dataset = FixedLenAdditionDataset(max_seq_len, num_examples=200, low=1000, high=9999, tokenizer=tokenizer)
+
+    if eval_range:
+        low, high = eval_range
+    else:
+        low, high = 1000, 9999
+
+    val_dataset = FixedLenAdditionDataset(max_seq_len, num_examples=200, low=low, high=high, tokenizer=tokenizer, few_shot=few_shot)
 
     return dataset, val_dataset

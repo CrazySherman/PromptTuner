@@ -8,6 +8,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+import copy
 import inspect
 from dataclasses import dataclass
 
@@ -131,9 +132,9 @@ class GPTConfig:
 
 
 class Inductor(nn.Module):
-    def __init__(self, wte, n_embd, prefix_tokens):
+    def __init__(self, wte, gpt_config, prefix_tokens, use_mlp=False, mlp_dropout=0.0):
         super().__init__()
-        a = torch.zeros(1, 100, n_embd)
+        a = torch.zeros(1, 100, gpt_config.n_embd)
         # part of tokens use random init,
         nn.init.xavier_uniform_(a)
 
@@ -149,10 +150,18 @@ class Inductor(nn.Module):
         print(f"num of tokens: {a.size()[1]} num of label init tokens: {len(ids)}")
         self._inductor = nn.Parameter(a)
 
+        self.use_mlp = use_mlp
+
+        if use_mlp:
+            config = copy.copy(gpt_config)
+            config.dropout = mlp_dropout
+            self.mlp = MLP(gpt_config)
 
     def forward(self):
-        return self._inductor
-
+        if self.use_mlp:
+            return self.mlp(self._inductor)
+        else:
+            return self._inductor
 
 
 class GPT(nn.Module):
@@ -187,9 +196,9 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def add_inductor(self, prefix_tokens):
+    def add_inductor(self, prefix_tokens, use_mlp=False, mlp_dropout=0.0):
          # inject inductor
-        self.inductor = Inductor(self.transformer.wte, self.config.n_embd, prefix_tokens)
+        self.inductor = Inductor(self.transformer.wte, self.config, prefix_tokens, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
 
 
     def get_num_params(self, non_embedding=True):
@@ -260,7 +269,7 @@ class GPT(nn.Module):
             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, prefix_tokens, override_args=None):
+    def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -314,7 +323,6 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
-        model.add_inductor(prefix_tokens)
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
