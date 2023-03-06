@@ -8,14 +8,13 @@
 import argparse
 import math
 import os
-import sys
 import time
 from contextlib import nullcontext
 
 import numpy as np
 
 import torch
-from arithmetics_task import generate_train_val_dataset, TARGET_TOKENS
+from arithmetics_task import generate_train_val_dataset, TASK_PROMPTS
 from model import GPT
 from task_common import compute_acc
 from torch.distributed import destroy_process_group, init_process_group
@@ -33,11 +32,13 @@ parser.add_argument('--wd', type=float, default=1e-1)
 parser.add_argument('--decay-lr', action="store_true")
 parser.add_argument('--min-lr', type=float, default=6e-5)
 parser.add_argument('--use-mlp', action="store_true")
-parser.add_argument('--mlp-dropout', type=float, default=0.0)
+parser.add_argument('--mlp-dropout', type=float, default=0.0) # no really useful in prompt tuning
 parser.add_argument('--few-shot', type=int, default=0)
 parser.add_argument('--eval-range', type=int, nargs="+")
-parser.add_argument('--epoch_val', action="store_true")
+parser.add_argument('--eval-examples', type=int, default=200)
+parser.add_argument('--epoch-val', action="store_true")
 parser.add_argument('--max-seq-len', type=int, default=None)
+parser.add_argument('--align-prompts',action="store_true")
 
 args = parser.parse_args()
 
@@ -96,7 +97,13 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 # dataset configs
 # -----------------------------------------------------------------------------
-dataset, val_dataset = generate_train_val_dataset(max_seq_len=args.max_seq_len, eval_only=eval_only, eval_range=args.eval_range, few_shot=None if args.few_shot == 0 else args.few_shot + 1)
+dataset, val_dataset = generate_train_val_dataset(
+    max_seq_len=args.max_seq_len,
+    eval_only=eval_only,
+    eval_range=args.eval_range,
+    few_shot=None if args.few_shot == 0 else args.few_shot + 1,
+    val_examples=args.eval_examples
+    )
 if not eval_only:
     dataloader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     print('Training Dataloader Len | batch_size | max_iters: ', len(dataloader), batch_size, len(dataloader) * NUM_EPOCHES)
@@ -109,7 +116,7 @@ print('Eval Dataloader Len | batch_size : ', len(val_dataloader), eval_batch_siz
 
 
 
-def run_eval(model):
+def run_eval(model, no_prefix=False):
     def _sample(logit):
         probs = F.softmax(logit.squeeze(), dim=1) # [b, C]
         return torch.multinomial(probs, 1).int()  # (1,)
@@ -132,7 +139,7 @@ def run_eval(model):
         while p1.shape[1] < val_dataset.max_seq_len: # fixed length decoding
             # auto-regressive
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-            l1, _ = model(p1)  # [b,1,C]
+            l1, _ = model(p1, no_prefix=no_prefix)  # [b,1,C]
             # teacher enforced -- not really useful
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
             s1 = _sample(l1)
@@ -185,17 +192,30 @@ print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
 # initialize from OpenAI GPT-2 weights
 override_args = dict(dropout=dropout)
 model = GPT.from_pretrained(init_from, override_args)
-model.add_inductor(TARGET_TOKENS, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
+model.add_inductor(TASK_PROMPTS, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
 # # read off the created config params, so we can store them into checkpoint correctly
 # for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
 #     model_args[k] = getattr(model.config, k)
 
+if eval_only:
+    ckpt_path = os.path.join(out_dir, ckpt_name)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    state_dict = checkpoint['inductor']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.inductor.load_state_dict(state_dict)
+    model.to(device)
+    run_eval(model)
+    print('done eval only')
+    exit(0)
+
 model.to(device)
-
 optimizer = torch.optim.AdamW(model.inductor.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
-
-
-print('optimizer targeted params: ', optimizer.param_groups)
+# print('optimizer targeted params: ', optimizer.param_groups)
 
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -220,27 +240,10 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-# if wandb_log and master_process:
-#     import wandb
-    # wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# val sanity check before train loop
-if eval_only:
-    ckpt_path = os.path.join(out_dir, ckpt_name)
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    state_dict = checkpoint['inductor']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.inductor.load_state_dict(state_dict)
-    run_eval(model)
-    print('done eval only, returning....')
-    exit(0)
-
+# first, assuming no prompt tuning is conducted, see how good the LLM is
+print("=============== Pure Prompt Engineering Results ==============")
+run_eval(model, no_prefix=True)
 
 # training loop
 t0 = time.time()

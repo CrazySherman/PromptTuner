@@ -4,32 +4,19 @@ from task_common import GPTTokenizer
 from torch.utils.data import Dataset
 from torch.utils.data import ConcatDataset
 
-NUM_EXAMPLES = 10000
-MAX_SEQ_LEN = 40
+NUM_EXAMPLES = 5000
+MAX_SEQ_LEN = 50
 LOW = 100
 HIGH = 9999
 START_INDICATOR = ":"
 EXAMPLE_SEPARATOR = " $ "
 # part of them use
-TARGET_TOKENS = [
-    "0",
-    "1",
-    "2",
-    "3",
-    "4",
-    "5",
-    "6",
-    "7",
-    "8",
-    "9",
-    "+",
-    "=",
-    ";",
+TASK_PROMPTS = [
+    "0 1 2 3 4 5 6 7 8 9 + = ; ",
     EXAMPLE_SEPARATOR,
     START_INDICATOR,
-    # "plus", "minus", "arithmetic", "equal", "digit", "calculate", "carry bits", "radix", "bit", "add", "number",
-    # chain-of-thought (CoT) like prompt
-    "number", "plus", "number", "equals to", "digit", "plus", "digit", "plus", "carry bits", "next",
+    # CoT like prompts
+    " number plus number equals to digit plus digit plus carry bits next",
 ]
 
 
@@ -42,8 +29,13 @@ def generate_addition(a, b):
 
     Clearly, this form of addition problem has no ambiguity. But what about other problems?
     """
+    def num2digit(a):
+        return " ".join(list(str(a)))
+
     # text = "%d+%d;" % (a, b) # symbolic form
-    text = "%d + %d : " % (a,b) # non symbolic form
+    # text = "%d + %d : " % (a,b) # non symbolic form
+    text = num2digit(a) + " + " + num2digit(b) + " : " # digit form, more friendly for language models
+
     carry = 0
     s = a + b
     while True:
@@ -59,7 +51,8 @@ def generate_addition(a, b):
         carry = (a % 10 + b % 10 + carry) // 10
         a = a // 10
         b = b // 10
-    text += " = %d $" % s
+
+    text += " = " + num2digit(s) + EXAMPLE_SEPARATOR
     return text
 
 
@@ -130,7 +123,7 @@ class FixedLenAdditionDataset(Dataset):
         return result
 
 
-def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False, eval_range=None):
+def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False, eval_range=None, val_examples=200):
     """Few shot settings:
         None -- zero-shot
         2 - 1-shot, so basically 1 demo + 1 query
@@ -154,6 +147,6 @@ def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False,
     else:
         low, high = 1000, 9999
 
-    val_dataset = FixedLenAdditionDataset(max_seq_len, num_examples=200, low=low, high=high, tokenizer=tokenizer, few_shot=few_shot)
+    val_dataset = FixedLenAdditionDataset(max_seq_len, num_examples=val_examples, low=low, high=high, tokenizer=tokenizer, few_shot=few_shot)
 
     return dataset, val_dataset

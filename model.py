@@ -132,7 +132,7 @@ class GPTConfig:
 
 
 class Inductor(nn.Module):
-    def __init__(self, wte, gpt_config, prefix_tokens, use_mlp=False, mlp_dropout=0.0):
+    def __init__(self, wte, gpt_config, prefix_tokens, use_mlp=False, mlp_dropout=0.0, no_tuning=False):
         super().__init__()
         a = torch.zeros(1, 100, gpt_config.n_embd)
         # part of tokens use random init,
@@ -142,9 +142,16 @@ class Inductor(nn.Module):
         ids = []
         for t in prefix_tokens:
             ids.extend(enc.encode(t))
+
         embs = wte(torch.tensor(ids, dtype=torch.long)).detach() # [n, d]
 
-        a[:,:len(ids)] = embs
+        if no_tuning:
+            print('[WARNING]: directly using user prompts, no soft prompts!')
+            a = embs.unsqueeze(0).detach()
+        else:
+            a[:,:len(ids)] = embs.detach()
+
+        self.prefix_len = len(ids)
 
         # a = embs.unsqueeze(0)  # option 3
         print(f"num of tokens: {a.size()[1]} num of label init tokens: {len(ids)}")
@@ -157,11 +164,20 @@ class Inductor(nn.Module):
             config.dropout = mlp_dropout
             self.mlp = MLP(gpt_config)
 
-    def forward(self):
-        if self.use_mlp:
-            return self.mlp(self._inductor)
+    def get_tuned_prompts(self):
+        return self._inductor[:,self.prefix_len:].detach().squeeze() # [m, d]
+
+    def forward(self, no_prefix=False):
+        # no prompt tuning, just use `guess words`
+        if no_prefix:
+            p = self._inductor[:,:self.prefix_len]
         else:
-            return self._inductor
+            p = self._inductor
+
+        if self.use_mlp:
+            return self.mlp(p)
+        else:
+            return p
 
 
 class GPT(nn.Module):
@@ -196,9 +212,27 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def add_inductor(self, prefix_tokens, use_mlp=False, mlp_dropout=0.0):
+    def add_inductor(self, prefix_tokens, use_mlp=False, mlp_dropout=0.0, no_tuning=False):
          # inject inductor
-        self.inductor = Inductor(self.transformer.wte, self.config, prefix_tokens, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
+        self.inductor = Inductor(self.transformer.wte, self.config, prefix_tokens, use_mlp=use_mlp, mlp_dropout=mlp_dropout, no_tuning=no_tuning)
+
+    def find_nearest_ids(self):
+        def cos_dist(A, a):
+            """
+                A: nxd
+                a: mxd
+            """
+            norm_A = A / torch.linalg.norm(A, dim=1, keepdim=True).expand_as(A)
+            norm_a = a / torch.linalg.norm(a, dim=1, keepdim=True).expand_as(a)
+            return torch.matmul(norm_A, norm_a.T) # nxm
+        tuned_prompts = self.inductor.get_tuned_prompts() # [m,d]
+
+        dist = cos_dist(self.transformer.wte.weight.data.detach(), tuned_prompts) # nxm
+        dist = torch.abs(dist) # use abs val
+        print('cosine dist max: ', dist.max(dim=0).values)
+        print('cosine dist min: ', dist.min(dim=0).values)
+        print('cosine dist avg: ', dist.mean(dim=0))
+        return torch.argmin(dist, dim=0).tolist()
 
 
     def get_num_params(self, non_embedding=True):
@@ -221,7 +255,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, no_prefix=False):
         """
         Args:
             input:    p1  p2  p3... pn    x     y    z
@@ -232,7 +266,7 @@ class GPT(nn.Module):
         """
         device = idx.device
         b, t = idx.size()
-        inductor = self.inductor()
+        inductor = self.inductor(no_prefix = no_prefix)
         k = inductor.shape[1]
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
