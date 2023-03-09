@@ -132,26 +132,32 @@ class GPTConfig:
 
 
 class Inductor(nn.Module):
-    def __init__(self, wte, gpt_config, prefix_tokens, use_mlp=False, mlp_dropout=0.0, no_tuning=False):
+    def __init__(self, wte, gpt_config, trigger_tokens, use_mlp=False, mlp_dropout=0.0, trigger_only=False):
+        """Add inductor prefix prompts, tunable, the prefix consists of 2 parts:
+                    trigger_token, tunable_token
+            tunable_token is random init, trigger_token is user provided prompts, trigger_token is also tuned
+            The total size of the prefix is set to be 100, referring to the paper: https://arxiv.org/abs/2010.15980
+            If trigger_only is set, only trigger token is used
+        """
         super().__init__()
-        a = torch.zeros(1, 100, gpt_config.n_embd)
+        device = wte.weight.device
+        a = torch.zeros(1, 100, gpt_config.n_embd).to(device)
         # part of tokens use random init,
         nn.init.xavier_uniform_(a)
 
         enc = tiktoken.get_encoding("gpt2")
         ids = []
-        for t in prefix_tokens:
+        for t in trigger_tokens:
             ids.extend(enc.encode(t))
 
-        embs = wte(torch.tensor(ids, dtype=torch.long)).detach() # [n, d]
+        embs = wte(torch.tensor(ids, dtype=torch.long, device=device)).detach() # [n, d]
 
-        if no_tuning:
+        if trigger_only:
             print('[WARNING]: directly using user prompts, no soft prompts!')
             a = embs.unsqueeze(0).detach()
         else:
             a[:,:len(ids)] = embs.detach()
 
-        self.prefix_len = len(ids)
 
         # a = embs.unsqueeze(0)  # option 3
         print(f"num of tokens: {a.size()[1]} num of label init tokens: {len(ids)}")
@@ -163,16 +169,16 @@ class Inductor(nn.Module):
             config = copy.copy(gpt_config)
             config.dropout = mlp_dropout
             self.mlp = MLP(gpt_config)
+            self.mlp.to(device)
 
     def get_tuned_prompts(self):
-        return self._inductor[:,self.prefix_len:].detach().squeeze() # [m, d]
+        """Return the entire prefix, including both trigger prompt as well as tunable prompt
+        """
+        return self.forward().detach().squeeze() # [m, d]
 
-    def forward(self, no_prefix=False):
+    def forward(self):
         # no prompt tuning, just use `guess words`
-        if no_prefix:
-            p = self._inductor[:,:self.prefix_len]
-        else:
-            p = self._inductor
+        p = self._inductor
 
         if self.use_mlp:
             return self.mlp(p)
@@ -187,6 +193,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.inductor = None
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -212,9 +219,9 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def add_inductor(self, prefix_tokens, use_mlp=False, mlp_dropout=0.0, no_tuning=False):
+    def add_inductor(self, trigger_tokens, use_mlp=False, mlp_dropout=0.0, trigger_only=False):
          # inject inductor
-        self.inductor = Inductor(self.transformer.wte, self.config, prefix_tokens, use_mlp=use_mlp, mlp_dropout=mlp_dropout, no_tuning=no_tuning)
+        self.inductor = Inductor(self.transformer.wte, self.config, trigger_tokens, use_mlp=use_mlp, mlp_dropout=mlp_dropout, trigger_only=trigger_only)
 
     def find_nearest_ids(self):
         def cos_dist(A, a):
@@ -255,7 +262,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, no_prefix=False):
+    def forward(self, idx, targets=None):
         """
         Args:
             input:    p1  p2  p3... pn    x     y    z
@@ -266,21 +273,28 @@ class GPT(nn.Module):
         """
         device = idx.device
         b, t = idx.size()
-        inductor = self.inductor(no_prefix = no_prefix)
-        k = inductor.shape[1]
+        if self.inductor is not None:
+            inductor = self.inductor()
+            k = inductor.shape[1]
+            t += k
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # add prefix soft embeddings
+        if self.inductor is not None:
+            tok_emb = torch.cat([inductor.expand(b, -1,-1), tok_emb], dim=1)
+
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(torch.cat([inductor.expand(b, -1,-1), tok_emb + pos_emb], dim=1))
+        x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         # drop the inductor prefix
-        x = x[:,k:]
+        if self.inductor is not None:
+            x = x[:,k:]
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)

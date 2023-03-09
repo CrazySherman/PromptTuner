@@ -2,8 +2,15 @@
 > cd & source nanogpt/bin/activate
 > cd rsc/nanoGPT/
 > export TIKTOKEN_CACHE_DIR=/home/shermanwong/rsc/nanoGPT/cached_tiktoken/
-> python finetune.py <train/eval>
+> python finetune.py args
 
+train
+
+> python finetune.py --task xxx --use-mlp  --lr 0.01 --decay-lr --min-lr 1e-3 --ckpt-name xxx
+
+eval
+
+> python finetune.py --eval --task xxx --use-mlp --ckpt-name xxx
 """
 import argparse
 import math
@@ -14,7 +21,6 @@ from contextlib import nullcontext
 import numpy as np
 
 import torch
-from arithmetics_task import generate_train_val_dataset, TASK_PROMPTS
 from model import GPT
 from task_common import compute_acc
 from torch.distributed import destroy_process_group, init_process_group
@@ -22,23 +28,23 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 parser = argparse.ArgumentParser(description='GPT2 prompt tuner')
+parser.add_argument('--task', type=str, default='arithmetics')
 parser.add_argument('--out-dir', '-o', type=str, default='/home/shermanwong/out')
 parser.add_argument('--eval', action="store_true")
 parser.add_argument('--ckpt-name', type=str, default='ckpt.pt')
 parser.add_argument('--epoches', type=int, default=20)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--warmup-iters', type=int, default=1000)
-parser.add_argument('--wd', type=float, default=1e-1)
+parser.add_argument('--wd', type=float, default=1e-5)
 parser.add_argument('--decay-lr', action="store_true")
 parser.add_argument('--min-lr', type=float, default=6e-5)
 parser.add_argument('--use-mlp', action="store_true")
 parser.add_argument('--mlp-dropout', type=float, default=0.0) # no really useful in prompt tuning
-parser.add_argument('--few-shot', type=int, default=0)
-parser.add_argument('--eval-range', type=int, nargs="+")
+# parser.add_argument('--few-shot', type=int, default=0) # discounraged for PromptFinder
+# parser.add_argument('--eval-range', type=int, nargs="+")
 parser.add_argument('--eval-examples', type=int, default=200)
 parser.add_argument('--epoch-val', action="store_true")
-parser.add_argument('--max-seq-len', type=int, default=None)
-parser.add_argument('--align-prompts',action="store_true")
+parser.add_argument('--print-found-prompts', action="store_true")
 
 args = parser.parse_args()
 
@@ -97,13 +103,37 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 # dataset configs
 # -----------------------------------------------------------------------------
-dataset, val_dataset = generate_train_val_dataset(
-    max_seq_len=args.max_seq_len,
-    eval_only=eval_only,
-    eval_range=args.eval_range,
-    few_shot=None if args.few_shot == 0 else args.few_shot + 1,
-    val_examples=args.eval_examples
+if args.task == "arithmetics":
+    from arithmetics_task import generate_train_val_dataset
+
+    dataset, val_dataset = generate_train_val_dataset(
+        eval_only=eval_only,
+        val_examples=args.eval_examples,
     )
+elif args.task == "symbolic":
+    from symbolic_task import generate_train_val_dataset
+
+    dataset, val_dataset = generate_train_val_dataset(
+        eval_only=eval_only, val_examples=args.eval_examples
+    )
+elif args.task == "reverse_letter":
+    from word_manipulate import generate_letter_reverse_dataset
+
+    dataset, val_dataset = generate_letter_reverse_dataset(
+        eval_only=eval_only,
+        val_examples=args.eval_examples,
+    )
+elif args.task == "last_letter_concat":
+    from word_manipulate import generate_last_letter_concat_dataset
+
+    dataset, val_dataset = generate_last_letter_concat_dataset(
+        eval_only=eval_only,
+        val_examples=args.eval_examples,
+    )
+else:
+    raise Exception(f"unsupported task name: {args.task}")
+
+
 if not eval_only:
     dataloader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     print('Training Dataloader Len | batch_size | max_iters: ', len(dataloader), batch_size, len(dataloader) * NUM_EPOCHES)
@@ -116,7 +146,7 @@ print('Eval Dataloader Len | batch_size : ', len(val_dataloader), eval_batch_siz
 
 
 
-def run_eval(model, no_prefix=False):
+def run_eval(model):
     def _sample(logit):
         probs = F.softmax(logit.squeeze(), dim=1) # [b, C]
         return torch.multinomial(probs, 1).int()  # (1,)
@@ -136,15 +166,14 @@ def run_eval(model, no_prefix=False):
         input = src.to(device).squeeze()  # (b,n,) padded to max_seq_len
         p1 = input[:,:num_prompt].int()  # "1234+1234="
         # start auto-regressive decoding
-        while p1.shape[1] < val_dataset.max_seq_len: # fixed length decoding
+        while p1.shape[1] < val_dataset.MAX_SEQ_LEN: # fixed length decoding
             # auto-regressive
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-            l1, _ = model(p1, no_prefix=no_prefix)  # [b,1,C]
+            l1, _ = model(p1)  # [b,1,C]
             # teacher enforced -- not really useful
             # with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
             s1 = _sample(l1)
             p1 = torch.cat([p1, s1], dim=1)
-
 
         a1, a3 = compute_acc(p1.detach().cpu().numpy(), tgt.detach().cpu().numpy(), num_prompt)
         acc1.append(a1)
@@ -192,7 +221,8 @@ print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
 # initialize from OpenAI GPT-2 weights
 override_args = dict(dropout=dropout)
 model = GPT.from_pretrained(init_from, override_args)
-model.add_inductor(TASK_PROMPTS, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
+model.to(device)
+model.add_inductor(val_dataset.TRIGGER_PROMPTS, use_mlp=use_mlp, mlp_dropout=mlp_dropout)
 # # read off the created config params, so we can store them into checkpoint correctly
 # for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
 #     model_args[k] = getattr(model.config, k)
@@ -211,9 +241,15 @@ if eval_only:
     model.to(device)
     run_eval(model)
     print('done eval only')
+    # just teasing, seeing how crazy overfitted the prompt is
+    if args.print_found_prompts:
+        ids = model.find_nearest_ids()
+        print('found nearest prompts: ')
+        hard_prompt = val_dataset.tokenizer.reverse(ids)
+        print(hard_prompt)
+
     exit(0)
 
-model.to(device)
 optimizer = torch.optim.AdamW(model.inductor.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 # print('optimizer targeted params: ', optimizer.param_groups)
 
@@ -243,7 +279,7 @@ def get_lr(it):
 
 # first, assuming no prompt tuning is conducted, see how good the LLM is
 print("=============== Pure Prompt Engineering Results ==============")
-run_eval(model, no_prefix=True)
+run_eval(model)
 
 # training loop
 t0 = time.time()

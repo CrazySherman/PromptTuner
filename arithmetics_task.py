@@ -5,20 +5,14 @@ from torch.utils.data import Dataset
 from torch.utils.data import ConcatDataset
 
 NUM_EXAMPLES = 5000
-MAX_SEQ_LEN = 50
 LOW = 100
 HIGH = 9999
 START_INDICATOR = ":"
 EXAMPLE_SEPARATOR = " $ "
-# part of them use
-TASK_PROMPTS = [
-    "0 1 2 3 4 5 6 7 8 9 + = ; ",
-    EXAMPLE_SEPARATOR,
-    START_INDICATOR,
-    # CoT like prompts
-    " number plus number equals to digit plus digit plus carry bits next",
-]
 
+
+def num2digit(a):
+    return " ".join(list(str(a)))
 
 def generate_addition(a, b):
     """The question is how to ensure the expressions (prompt) have no ambiguity, ambiguities like:
@@ -29,8 +23,6 @@ def generate_addition(a, b):
 
     Clearly, this form of addition problem has no ambiguity. But what about other problems?
     """
-    def num2digit(a):
-        return " ".join(list(str(a)))
 
     # text = "%d+%d;" % (a, b) # symbolic form
     # text = "%d + %d : " % (a,b) # non symbolic form
@@ -67,8 +59,15 @@ class FixedLenAdditionDataset(Dataset):
     Make sure you check [Example] in stdout to verify the
 
     """
-    def __init__(self, max_seq_len, num_examples=None, in_order=False, low=None, high=None, tokenizer=None, few_shot=None):
-        self.max_seq_len = max_seq_len
+    MAX_SEQ_LEN = 50
+    TRIGGER_PROMPTS = [
+        "0 1 2 3 4 5 6 7 8 9 + = ; ",
+        EXAMPLE_SEPARATOR,
+        START_INDICATOR,
+        # CoT like prompts
+        " number plus number equals to digit plus digit plus carry bits next",
+    ]
+    def __init__(self, num_examples=None, in_order=False, low=None, high=None, tokenizer=None, few_shot=None):
         self.epoch_len = num_examples
         self.tokenizer = tokenizer
         self.few_shot = few_shot
@@ -76,7 +75,7 @@ class FixedLenAdditionDataset(Dataset):
         self.low = low if low is not None else LOW
         self.high = high if high is not None else HIGH
 
-        print('[FixedLenAdditionDataset]: low ', self.low, " high ", self.high, " max_seq_len: ", self.max_seq_len, " inorder: ", in_order)
+        print('[FixedLenAdditionDataset]: low ', self.low, " high ", self.high, " inorder: ", in_order)
         if in_order:
             assert num_examples is None, "we are generating all combinations in order, num_examples is random sampling"
             print('generating all of sum ops in this range: ', (self.high - self.low) ** 2)
@@ -123,21 +122,18 @@ class FixedLenAdditionDataset(Dataset):
         return result
 
 
-def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False, eval_range=None, val_examples=200):
-    """Few shot settings:
+def generate_train_val_dataset(few_shot=None, eval_only=False, eval_range=None, val_examples=200):
+    """[Discoveraged]Few shot settings:
         None -- zero-shot
         2 - 1-shot, so basically 1 demo + 1 query
         3 - 2-host, 2 demo + 1 query
     """
     # train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     # val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    if max_seq_len is None:
-        max_seq_len = MAX_SEQ_LEN
-
-    tokenizer = GPTTokenizer(max_seq_len, START_INDICATOR)
+    tokenizer = GPTTokenizer(FixedLenAdditionDataset.MAX_SEQ_LEN, START_INDICATOR)
     if not eval_only:
-        d1 = FixedLenAdditionDataset(max_seq_len, num_examples=NUM_EXAMPLES, tokenizer=tokenizer, few_shot=few_shot) # noqa
-        d2 = FixedLenAdditionDataset(max_seq_len, low=0, high=LOW, in_order=True, tokenizer=tokenizer, few_shot=few_shot)
+        d1 = FixedLenAdditionDataset(num_examples=NUM_EXAMPLES, tokenizer=tokenizer, few_shot=few_shot) # noqa
+        d2 = FixedLenAdditionDataset(low=0, high=LOW, in_order=True, tokenizer=tokenizer, few_shot=few_shot)
         dataset = ConcatDataset([d1, d2])
     else:
         dataset = None
@@ -147,6 +143,6 @@ def generate_train_val_dataset(max_seq_len=None, few_shot=None, eval_only=False,
     else:
         low, high = 1000, 9999
 
-    val_dataset = FixedLenAdditionDataset(max_seq_len, num_examples=val_examples, low=low, high=high, tokenizer=tokenizer, few_shot=few_shot)
+    val_dataset = FixedLenAdditionDataset(num_examples=val_examples, low=low, high=high, tokenizer=tokenizer, few_shot=few_shot)
 
     return dataset, val_dataset
