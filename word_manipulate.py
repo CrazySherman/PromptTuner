@@ -95,7 +95,8 @@ def generate_letter_reverse_dataset(eval_only=False, val_examples=200):
     else:
         dataset = None
 
-    val_dataset = FixedLetterReverseDataset(val_examples, tokenizer=tokenizer)
+    # change max_letters if you wanna see OOD performance
+    val_dataset = FixedLetterReverseDataset(val_examples, tokenizer=tokenizer, max_letter=12)
     return dataset, val_dataset
 
 
@@ -106,6 +107,6 @@ def generate_last_letter_concat_dataset(eval_only=False, val_examples=200):
     else:
         dataset = None
 
-    # change max_letters if you wanna see OOD performance
-    val_dataset = FixedLenConcatLastLetterDataset(val_examples, tokenizer=tokenizer, fixed_letter=10)
+    # change num_words if you wanna see OOD performance
+    val_dataset = FixedLenConcatLastLetterDataset(val_examples, tokenizer=tokenizer, fixed_letter=5, num_words=7)
     return dataset, val_dataset

@@ -1,17 +1,3 @@
-"""
-> cd & source nanogpt/bin/activate
-> cd rsc/nanoGPT/
-> export TIKTOKEN_CACHE_DIR=/home/shermanwong/rsc/nanoGPT/cached_tiktoken/
-> python finetune.py args
-
-train
-
-> python finetune.py --task xxx --use-mlp  --lr 0.01 --decay-lr --min-lr 1e-3 --ckpt-name xxx
-
-eval
-
-> python finetune.py --eval --task xxx --use-mlp --ckpt-name xxx
-"""
 import argparse
 import math
 import os
